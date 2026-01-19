@@ -15,9 +15,8 @@ from opentelemetry._logs.severity import SeverityNumber
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import _internal
-from opentelemetry.sdk._logs._internal import (
-    ReadableLogRecord as LogData,
+from opentelemetry.sdk._logs import (
+    LogData,
     LoggerProvider,
     LoggingHandler,
     LogRecord,
