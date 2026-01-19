@@ -202,6 +202,56 @@ This will output logs like:
 [FILTERED-INTERIM] Ignored: 'yeah' (agent speaking: True)
 ```
 
-## 📝 License
+## � Proof of Functionality - Log Transcript
+
+The following log transcript demonstrates all 4 test cases passing:
+
+### Test Case 1 - Backchannels ignored while speaking:
+```
+INFO:context-aware-agent:[FILTER] 'Yeah.' (speaking=True, active=True) → IGNORE (backchannel)
+INFO:context-aware-agent:[FILTER] 'Okay.' (speaking=True, active=True) → IGNORE (backchannel)
+WARNING:livekit.agents:skipping reply to user input, current speech generation cannot be interrupted
+```
+✅ Agent continues speaking - backchannels are ignored!
+
+### Test Case 2 - Interrupt words stop the agent:
+```
+INFO:context-aware-agent:[FILTER] 'Stop.' (speaking=True, active=True) → INTERRUPT (contains interrupt word)
+INFO:context-aware-agent:[FILTER] Forced interrupt via activity.interrupt()
+```
+✅ Agent stops immediately when "stop" is detected!
+
+### Test Case 3 - Backchannels processed when agent is silent:
+```
+INFO:context-aware-agent:[FILTER] 'Okay.' (speaking=False, active=False) → PROCESS
+DEBUG:livekit.agents:received user transcript {"user_transcript": "Okay."}
+DEBUG:livekit.agents:using preemptive generation
+```
+✅ Agent processes "Okay" as valid input when not speaking!
+
+### Test Case 4 - Mixed input with interrupt word:
+```
+INFO:context-aware-agent:[FILTER] 'Okay. Stop.' (speaking=True, active=True) → INTERRUPT (contains interrupt word)
+INFO:context-aware-agent:[FILTER] Forced interrupt via activity.interrupt()
+```
+✅ Interrupt word in mixed input correctly triggers interruption!
+
+### Bonus - "No" also works as interrupt:
+```
+INFO:context-aware-agent:[FILTER] 'No.' (speaking=True, active=True) → INTERRUPT (contains interrupt word)
+INFO:context-aware-agent:[FILTER] Forced interrupt via activity.interrupt()
+```
+
+## 🔑 Key Implementation Details
+
+### Critical Settings
+
+1. **`discard_audio_if_uninterruptible=False`** - This is essential! Without this, audio is discarded when interruptions are disabled, and "stop" would never be detected by STT.
+
+2. **Proactive Interruption Disabling** - New speech handles have `allow_interruptions=False` set immediately, preventing VAD from triggering before we can filter.
+
+3. **Force Interrupt** - When interrupt words are detected, we call `activity.interrupt(force=True)` to stop the agent immediately.
+
+## �📝 License
 
 Apache-2.0 (same as LiveKit Agents)

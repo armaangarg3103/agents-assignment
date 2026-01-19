@@ -57,8 +57,12 @@ def patch_agent_activity(activity: AgentActivity, filter_instance: InterruptionF
     """
     Patch an AgentActivity instance to add backchannel filtering.
     
-    This patches the on_interim_transcript and on_final_transcript methods
-    to filter out backchannels when the agent is speaking.
+    Strategy: 
+    1. Proactively disable allow_interruptions on NEW speech handles
+    2. When we get a transcript, check if it contains interrupt words
+    3. If interrupt words found: enable interruptions and force interrupt
+    4. If only backchannels: keep interruptions disabled
+    5. If real content (neither): enable interruptions and let system handle it
     """
     
     # Store original methods
@@ -66,39 +70,116 @@ def patch_agent_activity(activity: AgentActivity, filter_instance: InterruptionF
     original_on_final = activity.on_final_transcript
     original_on_vad_done = activity.on_vad_inference_done
     
-    # Track the last filter decision for VAD coordination
-    last_filter_decision = {"value": None}
+    # Track last seen speech handle to detect new ones
+    last_speech_id = {"id": None}
     
-    def is_agent_speaking() -> bool:
-        """Check if the agent is currently speaking."""
-        # Check agent state
-        if activity._session.agent_state == "speaking":
-            return True
-        # Check for active speech handle
-        if activity._current_speech is not None and not activity._current_speech.interrupted:
-            return True
-        # Check for paused speech
-        if activity._paused_speech is not None:
+    def get_current_speech():
+        """Get the current or paused speech handle."""
+        return activity._current_speech or activity._paused_speech
+    
+    def has_active_speech() -> bool:
+        """Check if there's an active (non-interrupted, non-done) speech handle."""
+        speech = get_current_speech()
+        if speech is not None and not speech.interrupted and not speech.done():
             return True
         return False
     
-    def should_filter(transcript: str) -> bool:
-        """Determine if transcript should be filtered."""
+    def is_agent_speaking() -> bool:
+        """Check if the agent is currently speaking - use multiple signals."""
+        # Primary check: agent state
+        if activity._session.agent_state == "speaking":
+            return True
+        # Secondary check: active speech handle exists
+        if has_active_speech():
+            return True
+        return False
+    
+    def check_and_disable_new_speech():
+        """Check for new speech handles and proactively disable interruptions."""
+        speech = get_current_speech()
+        if speech is None:
+            last_speech_id["id"] = None
+            return
+        
+        # If this is a new speech handle we haven't seen
+        if speech.id != last_speech_id["id"]:
+            last_speech_id["id"] = speech.id
+            # Proactively disable interruptions on new speech
+            if not speech.interrupted and speech.allow_interruptions:
+                try:
+                    speech.allow_interruptions = False
+                    logger.info(f"[FILTER] Proactively disabled interruptions on new speech {speech.id[:8]}")
+                except RuntimeError:
+                    pass
+    
+    def force_interrupt():
+        """Force interrupt the current speech - used for interrupt words like 'wait', 'stop'."""
+        speech = get_current_speech()
+        if speech is not None and not speech.interrupted:
+            # First enable interruptions so we can interrupt
+            if not speech.allow_interruptions:
+                speech.allow_interruptions = True
+            # Now force interrupt using the activity's interrupt method
+            try:
+                activity.interrupt(force=True)
+                logger.info("[FILTER] Forced interrupt via activity.interrupt()")
+            except Exception as e:
+                logger.warning(f"[FILTER] Could not interrupt: {e}")
+    
+    def contains_interrupt_words(transcript: str) -> bool:
+        """Check if transcript contains interrupt command words."""
+        if not transcript:
+            return False
+        words = set(transcript.lower().replace(".", "").replace(",", "").replace("?", "").replace("!", "").split())
+        interrupt_words = filter_instance.config.interruption_words
+        return bool(words & interrupt_words)
+    
+    def is_pure_backchannel(transcript: str) -> bool:
+        """Check if transcript is ONLY backchannel words."""
         if not transcript or not transcript.strip():
             return True
+        words = set(transcript.lower().replace(".", "").replace(",", "").replace("?", "").replace("!", "").split())
+        # Remove empty strings
+        words = {w for w in words if w}
+        if not words:
+            return True
+        # Check if ALL words are backchannels
+        backchannel_words = filter_instance.config.backchannel_words
+        return words.issubset(backchannel_words)
+    
+    def filter_and_decide(transcript: str) -> tuple[bool, FilterDecision]:
+        """Filter transcript and return (should_ignore, decision)."""
+        if not transcript or not transcript.strip():
+            return True, FilterDecision.IGNORE
         
         speaking = is_agent_speaking()
-        result = filter_instance.filter(transcript, speaking)
-        last_filter_decision["value"] = result.decision
+        active_speech = has_active_speech()
         
-        return result.decision == FilterDecision.IGNORE
+        # Always check for interrupt words first - these should ALWAYS interrupt
+        if contains_interrupt_words(transcript):
+            logger.info(f"[FILTER] '{transcript}' (speaking={speaking}, active={active_speech}) → INTERRUPT (contains interrupt word)")
+            return False, FilterDecision.INTERRUPT
+        
+        # If there's an active speech handle and this is pure backchannel, ignore
+        if active_speech and is_pure_backchannel(transcript):
+            logger.info(f"[FILTER] '{transcript}' (speaking={speaking}, active={active_speech}) → IGNORE (backchannel)")
+            return True, FilterDecision.IGNORE
+        
+        # Otherwise process normally
+        logger.info(f"[FILTER] '{transcript}' (speaking={speaking}, active={active_speech}) → PROCESS")
+        return False, FilterDecision.PROCESS
     
     def patched_on_interim_transcript(ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         """Patched interim transcript handler with backchannel filtering."""
+        # First check for new speech handles
+        check_and_disable_new_speech()
+        
         transcript = ev.alternatives[0].text if ev.alternatives else ""
         
-        if should_filter(transcript):
-            # Still emit the transcription event for logging/display
+        should_ignore, decision = filter_and_decide(transcript)
+        
+        if should_ignore:
+            # Backchannel detected - keep interruptions disabled, just emit for UI
             activity._session._user_input_transcribed(
                 UserInputTranscribedEvent(
                     language=ev.alternatives[0].language if ev.alternatives else None,
@@ -107,19 +188,32 @@ def patch_agent_activity(activity: AgentActivity, filter_instance: InterruptionF
                     speaker_id=ev.alternatives[0].speaker_id if ev.alternatives else None,
                 ),
             )
-            logger.info(f"[FILTERED-INTERIM] Ignored: '{transcript}' (agent speaking: {is_agent_speaking()})")
-            # DON'T call original - this prevents _interrupt_by_audio_activity
             return
         
-        # Not filtered - proceed with original behavior
+        # Real content or interrupt detected
+        if decision == FilterDecision.INTERRUPT:
+            # Interrupt word detected ("wait", "stop") - force interrupt the agent
+            force_interrupt()
+        
+        # Enable interruptions and proceed normally
+        speech = get_current_speech()
+        if speech is not None and not speech.interrupted and not speech.allow_interruptions:
+            speech.allow_interruptions = True
+            logger.info("[FILTER] Re-enabled interruptions")
+        
         original_on_interim(ev, speaking=speaking)
     
     def patched_on_final_transcript(ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None:
         """Patched final transcript handler with backchannel filtering."""
+        # First check for new speech handles
+        check_and_disable_new_speech()
+        
         transcript = ev.alternatives[0].text if ev.alternatives else ""
         
-        if should_filter(transcript):
-            # Emit the event for logging
+        should_ignore, decision = filter_and_decide(transcript)
+        
+        if should_ignore:
+            # Backchannel - keep interruptions disabled, just emit for UI
             activity._session._user_input_transcribed(
                 UserInputTranscribedEvent(
                     language=ev.alternatives[0].language if ev.alternatives else None,
@@ -128,31 +222,26 @@ def patch_agent_activity(activity: AgentActivity, filter_instance: InterruptionF
                     speaker_id=ev.alternatives[0].speaker_id if ev.alternatives else None,
                 ),
             )
-            logger.info(f"[FILTERED-FINAL] Ignored: '{transcript}' (agent speaking: {is_agent_speaking()})")
-            # DON'T call original - this prevents interruption
             return
         
-        # Not filtered - proceed with original behavior
+        # Real content or interrupt detected
+        if decision == FilterDecision.INTERRUPT:
+            # Interrupt word detected ("wait", "stop") - force interrupt the agent
+            force_interrupt()
+        
+        # Enable interruptions and proceed normally
+        speech = get_current_speech()
+        if speech is not None and not speech.interrupted and not speech.allow_interruptions:
+            speech.allow_interruptions = True
+            logger.info("[FILTER] Re-enabled interruptions")
+        
         original_on_final(ev, speaking=speaking)
     
     def patched_on_vad_inference_done(ev: vad.VADEvent) -> None:
-        """Patched VAD handler that respects filter decisions."""
-        # If turn detection is manual or realtime_llm, let original handle it
-        if activity._turn_detection in ("manual", "realtime_llm"):
-            original_on_vad_done(ev)
-            return
-        
-        # If speech is too short, let original handle it (it will ignore anyway)
-        if ev.speech_duration < activity._session.options.min_interruption_duration:
-            original_on_vad_done(ev)
-            return
-        
-        # If we recently filtered a transcript and agent is speaking, suppress VAD interrupt
-        if last_filter_decision["value"] == FilterDecision.IGNORE and is_agent_speaking():
-            logger.info(f"[FILTERED-VAD] Suppressing VAD interrupt (last transcript was backchannel)")
-            return
-        
-        # Otherwise proceed normally
+        """Patched VAD handler - check for new speech and disable interruptions proactively."""
+        # Proactively check for new speech handles and disable interruptions
+        check_and_disable_new_speech()
+        # Call original - the allow_interruptions flag on speech handle will control it
         original_on_vad_done(ev)
     
     # Apply patches
@@ -160,7 +249,7 @@ def patch_agent_activity(activity: AgentActivity, filter_instance: InterruptionF
     activity.on_final_transcript = patched_on_final_transcript
     activity.on_vad_inference_done = patched_on_vad_inference_done
     
-    logger.info("[Patch] AgentActivity patched with backchannel filtering")
+    logger.info("[Patch] AgentActivity patched with allow_interruptions filtering")
 
 
 class ContextAwareAgent(Agent):
@@ -319,6 +408,9 @@ async def entrypoint(ctx: JobContext):
         # Disable default false interruption handling - we handle it ourselves
         resume_false_interruption=False,
         false_interruption_timeout=None,
+        # CRITICAL: Keep processing audio even when allow_interruptions=False
+        # This allows our filter to receive "stop" and other interrupt words
+        discard_audio_if_uninterruptible=False,
     )
     
     # Create our context-aware agent with the filter config
